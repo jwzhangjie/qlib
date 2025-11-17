@@ -1,0 +1,169 @@
+version: '3.8'
+
+services:
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: qlib-trading-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-qlib_trading}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - qlib-trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis缓存
+  redis:
+    image: redis:7-alpine
+    container_name: qlib-trading-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - qlib-trading-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 后端API服务
+  backend:
+    build:
+      context: ./qlib-trading-backend
+      dockerfile: Dockerfile
+    container_name: qlib-trading-backend
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-qlib_trading}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-here}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-your-tushare-token}
+      - QLIB_DATA_PATH=/app/data/qlib
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./qlib-trading-backend/data:/app/data
+      - ./qlib-trading-backend/logs:/app/logs
+      - ./qlib-trading-backend/models:/app/models
+      - ./qlib-trading-backend/backtests:/app/backtests
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - qlib-trading-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 前端服务
+  frontend:
+    build:
+      context: ./qlib-trading-platform
+      dockerfile: Dockerfile
+    container_name: qlib-trading-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - qlib-trading-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery任务队列
+  celery-worker:
+    build:
+      context: ./qlib-trading-backend
+      dockerfile: Dockerfile
+    container_name: qlib-trading-celery
+    command: celery -A app.core.celery worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-qlib_trading}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-here}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-your-tushare-token}
+      - QLIB_DATA_PATH=/app/data/qlib
+    volumes:
+      - ./qlib-trading-backend/data:/app/data
+      - ./qlib-trading-backend/logs:/app/logs
+      - ./qlib-trading-backend/models:/app/models
+      - ./qlib-trading-backend/backtests:/app/backtests
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - qlib-trading-network
+
+  # Celery Beat调度器
+  celery-beat:
+    build:
+      context: ./qlib-trading-backend
+      dockerfile: Dockerfile
+    container_name: qlib-trading-celery-beat
+    command: celery -A app.core.celery beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-qlib_trading}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-here}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-your-tushare-token}
+      - QLIB_DATA_PATH=/app/data/qlib
+    volumes:
+      - ./qlib-trading-backend/data:/app/data
+      - ./qlib-trading-backend/logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - qlib-trading-network
+
+  # Nginx反向代理
+  nginx:
+    image: nginx:alpine
+    container_name: qlib-trading-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - qlib-trading-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  qlib-trading-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
